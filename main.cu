@@ -198,11 +198,13 @@ __device__ void generate_random_in_range(BigInt* result, curandStateMRG32k3a_t* 
         carry = (sum > 0xFFFFFFFFULL);
     }
 }
+
 __device__ __host__ void clear_last_6_hex(BigInt* num) {
     // Last 5 hex digits = 20 bits
     // Clear the least significant 20 bits
     num->data[0] &= 0xFF000000;  // Keep upper 12 bits, clear lower 20 bits
 }
+
 // Global device constants for min/max as BigInt
 __constant__ BigInt d_min_bigint;
 __constant__ BigInt d_max_bigint;
@@ -212,9 +214,8 @@ __device__ volatile int g_found = 0;
 __device__ char g_found_hex[65] = {0};
 __device__ char g_found_hash160[41] = {0};
 
-// OPTIMIZED KERNEL: Each thread checks BATCH_SIZE sequential keys
-// Starting from: base_key + (tid * BATCH_SIZE)
-__global__ void start(const uint8_t* target, int total_threads)
+
+__global__ void start(const uint8_t* target)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -260,7 +261,7 @@ __global__ void start(const uint8_t* target, int total_threads)
         char hex_key[65];
         bigint_to_hex(&priv_base, hex_key);
         hash160_to_hex(hash160_batch[0], hash160_str);
-        printf("Base key: %s -> %s (checking %d sequential keys)\n", hex_key, hash160_str, BATCH_SIZE);
+        printf("Base key: %s -> %s | scanned completely last 6 hex\n", hex_key, hash160_str);
     }
     
     // --- Check all results from the batch ---
@@ -326,13 +327,11 @@ bool run_with_quantum_data(const char* min, const char* max, const char* target,
     auto start_time = std::chrono::high_resolution_clock::now();
     //auto last_print_time = start_time;
     int iteration = 0;
-    
-    // Setup random number generator for host
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<uint32_t> dis(0, 0xFFFFFFFF);
-    
+	std::random_device rd;
+	std::mt19937_64 gen(rd());
+	std::uniform_int_distribution<uint32_t> dis(0, 0xFFFFFFFF);
     while(true) {
+		
         // Generate ONE random base key for all threads on HOST
         BigInt base_key;
         
@@ -388,7 +387,7 @@ bool run_with_quantum_data(const char* min, const char* max, const char* target,
         auto kernel_start = std::chrono::high_resolution_clock::now();
         
         // Launch kernel - each thread checks base_key + thread_id
-        start<<<blocks, threads>>>(d_target, total_threads);
+        start<<<blocks, threads>>>(d_target);
         cudaDeviceSynchronize();
         
         auto kernel_end = std::chrono::high_resolution_clock::now();
@@ -469,7 +468,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     int blocks = (argc >= 5) ? std::stoi(argv[4]) : 1024;
-    int threads = (argc >= 6) ? std::stoi(argv[5]) : 128;
+    int threads = (argc >= 6) ? std::stoi(argv[5]) : 256;
     int device_id = (argc >= 7) ? std::stoi(argv[6]) : 0;
     
     // Validate input lengths match
