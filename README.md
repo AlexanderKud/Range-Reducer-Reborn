@@ -17,3 +17,11 @@ also if you have multiple GPUS use 0, 1, 2 as last parameter like this:
 `main.exe 100000000 1ffffffff 4e15e5189752d1eaf444dfd6bff399feb0443977 0` - puzzle 33\
 `main.exe 100000000 1ffffffff 4e15e5189752d1eaf444dfd6bff399feb0443977 1` - puzzle 33\
 `main.exe 100000000 1ffffffff 4e15e5189752d1eaf444dfd6bff399feb0443977 2` - puzzle 33
+
+in case if this was useful to you, can you please donate BTC:
+
+`bc1q8n38pk3urztlt4vceq0h089l9jdcw58l2c0e80`
+
+so i will be more motivated to develop further this project
+
+author: https://t.me/biernus
