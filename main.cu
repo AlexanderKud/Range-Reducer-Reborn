@@ -334,7 +334,7 @@ bool run_with_quantum_data(const char* min, const char* max, const char* target,
 	
     uint64_t seed;
 	BCryptGenRandom(NULL, (PUCHAR)&seed, sizeof(seed), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    std::mt19937_64 gen(seed);
+    std::mt19937 gen(seed);
     std::uniform_int_distribution<uint32_t> dis(0, 0xFFFFFFFF);
     
     // Pre-calculate range once (outside loop)
@@ -367,33 +367,45 @@ bool run_with_quantum_data(const char* min, const char* max, const char* target,
     cudaStreamCreate(&stream);
     
     while(true) {
-        // Generate ONE random base key for all threads on HOST
-        BigInt base_key;
-        BigInt random_val;
-        
-        // Generate random value in [0, range]
-        for (int i = 0; i < BIGINT_WORDS; ++i) {
-            random_val.data[i] = dis(gen);
-        }
-        
-        // Apply mask to fit within range
-        if (highest_word >= 0) {
-            random_val.data[highest_word] &= mask;
-            
-            for (int i = highest_word + 1; i < BIGINT_WORDS; ++i) {
-                random_val.data[i] = 0;
-            }
-        }
-        
-        // base_key = random_val + min
-        bool carry = false;
-        for (int i = 0; i < BIGINT_WORDS; ++i) {
-            uint64_t sum = (uint64_t)random_val.data[i] + (uint64_t)min_bigint.data[i] + (carry ? 1 : 0);
-            base_key.data[i] = (uint32_t)sum;
-            carry = (sum > 0xFFFFFFFFULL);
-        }
-        
-        clear_last_6_hex(&base_key);
+		// Generate ONE random base key for all threads on HOST
+		BigInt base_key;
+		BigInt random_val;
+
+		// Determine highest non-zero word in range
+		int highest_nonzero = 0;
+		for (int i = BIGINT_WORDS - 1; i >= 0; --i) {
+			if (range.data[i] != 0) {
+				highest_nonzero = i;
+				break;
+			}
+		}
+
+		// Generate only words from LSB up to highest_nonzero
+		for (int i = 0; i <= highest_nonzero; ++i) {
+			if (i < highest_nonzero) {
+				random_val.data[i] = dis(gen); // full 32-bit random
+			} else {
+				// Apply mask to highest word to stay within range
+				random_val.data[i] = dis(gen) & mask;
+			}
+		}
+
+		// Zero all higher words beyond highest_nonzero
+		for (int i = highest_nonzero + 1; i < BIGINT_WORDS; ++i) {
+			random_val.data[i] = 0;
+		}
+
+		// Add min_bigint to stay within [min, max]
+		bool carry = false;
+		for (int i = 0; i < BIGINT_WORDS; ++i) {
+			uint64_t sum = (uint64_t)random_val.data[i] + (uint64_t)min_bigint.data[i] + (carry ? 1 : 0);
+			base_key.data[i] = (uint32_t)sum;
+			carry = (sum > 0xFFFFFFFFULL);
+		}
+
+		// Clear last 6 hex chars (lower 24 bits)
+		clear_last_6_hex(&base_key);
+
         
         // Copy base key to device constant memory asynchronously
         cudaMemcpyToSymbolAsync(d_base_key, &base_key, sizeof(BigInt), 0, cudaMemcpyHostToDevice, stream);
