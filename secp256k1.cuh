@@ -4,13 +4,13 @@
 #include <string.h>
 
 #define BIGINT_WORDS 8
-const int64_t WINDOW_SIZE = 20;
-#define NUM_BASE_POINTS 8
+#define WINDOW_SIZE 16
+#define NUM_BASE_POINTS 16
 #define BATCH_SIZE 128
-#define MOD_EXP 5
+#define MOD_EXP 4
 
 
-struct BigInt {
+struct __align__(16) BigInt {
     uint32_t data[BIGINT_WORDS];
 };
 
@@ -42,28 +42,55 @@ __host__ __device__ __forceinline__ void init_bigint(BigInt *x, uint32_t val) {
     for (int i = 1; i < BIGINT_WORDS; i++) x->data[i] = 0;
 }
 
-__host__ __device__ __forceinline__ void copy_bigint(BigInt *dest, const BigInt *src) {
-	
-    for (int i = 0; i < BIGINT_WORDS; i++) {
-        dest->data[i] = src->data[i];
-    }
+__device__ __forceinline__ void copy_bigint(BigInt *dest, const BigInt *src) {
+    
+    uint4 *dest_vec = (uint4*)dest->data;
+    const uint4 *src_vec = (const uint4*)src->data;
+    
+    dest_vec[0] = src_vec[0];  
+    dest_vec[1] = src_vec[1];
 }
 
-__host__ __device__ __forceinline__ int compare_bigint(const BigInt *a, const BigInt *b) {
-	
-    for (int i = BIGINT_WORDS - 1; i >= 0; i--) {
-        if (a->data[i] > b->data[i]) return 1;
-        if (a->data[i] < b->data[i]) return -1;
+__device__ __forceinline__ int compare_bigint(const BigInt *a, const BigInt *b) {
+    uint32_t gt = 0, lt = 0;
+    
+    for (int i = 7; i >= 0; i--) {
+        uint32_t a_word = a->data[i];
+        uint32_t b_word = b->data[i];
+        
+        
+        uint32_t gt_mask = (a_word > b_word) ? 0xFFFFFFFF : 0;
+        uint32_t lt_mask = (a_word < b_word) ? 0xFFFFFFFF : 0;
+        
+        
+        uint32_t update_mask = (gt == 0 && lt == 0) ? 0xFFFFFFFF : 0;
+        gt |= (gt_mask & update_mask);
+        lt |= (lt_mask & update_mask);
     }
-    return 0;
+    
+    return gt ? 1 : (lt ? -1 : 0);
 }
 
-__host__ __device__ __forceinline__ bool is_zero(const BigInt *a) {
-	
-    for (int i = 0; i < BIGINT_WORDS; i++) {
-        if (a->data[i]) return false;
-    }
-    return true;
+__device__ __forceinline__ bool is_zero(const BigInt *a) {
+    uint32_t result;
+    
+    asm volatile(
+        "{\n\t"
+        ".reg .u32 t0, t1, t2, t3;\n\t"
+        "or.b32 t0, %1, %2;\n\t"
+        "or.b32 t1, %3, %4;\n\t"
+        "or.b32 t2, %5, %6;\n\t"
+        "or.b32 t3, %7, %8;\n\t"
+        "or.b32 t0, t0, t1;\n\t"
+        "or.b32 t2, t2, t3;\n\t"
+        "or.b32 %0, t0, t2;\n\t"
+        "}"
+        : "=r"(result)
+        : "r"(a->data[0]), "r"(a->data[1]), "r"(a->data[2]), "r"(a->data[3]),
+          "r"(a->data[4]), "r"(a->data[5]), "r"(a->data[6]), "r"(a->data[7])
+    );
+    
+    return (result == 0);
 }
 
 __host__ __device__ __forceinline__ int get_bit(const BigInt *a, int i) {
@@ -126,10 +153,6 @@ __device__ __forceinline__ void point_copy_jac(ECPointJac *dest, const ECPointJa
 __device__ __forceinline__ void sub_mod_device_fast(BigInt *res, const BigInt *a, const BigInt *b);
 
 
-__device__ __forceinline__ void bigint_sub_nored(BigInt *r, const BigInt *a, const BigInt *b) {
-    ptx_u256Sub(r, a, b);
-}
-
 __device__ __forceinline__ void add_9word(uint32_t r[9], const uint32_t addend[9]) {
     
     asm volatile(
@@ -171,13 +194,8 @@ __device__ __forceinline__ void add_9word_with_carry(uint32_t r[9], const uint32
     }
     r[8] = carry; 
 }
-
 __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
     
-    // Comba multiplication using 96-bit accumulator (3x32-bit words)
-    uint32_t product[16];
-    
-    // We'll use inline PTX for mad.lo.cc.u32 and madc.hi.cc.u32 for efficient multiply-accumulate
     #define MULADD(i, j) \
         asm volatile( \
             "mad.lo.cc.u32 %0, %3, %4, %0;\n\t" \
@@ -188,44 +206,40 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
         );
     
     uint32_t c0, c1, c2;
+    uint32_t result[8];
+    uint32_t prod_high[8];
     
-    // Column 0
     c0 = c1 = c2 = 0;
     asm("mul.lo.u32 %0, %1, %2;" : "=r"(c0) : "r"(a->data[0]), "r"(b->data[0]));
     asm("mul.hi.u32 %0, %1, %2;" : "=r"(c1) : "r"(a->data[0]), "r"(b->data[0]));
-    product[0] = c0;
+    result[0] = c0;
     
-    // Column 1
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(0, 1);
     MULADD(1, 0);
-    product[1] = c0;
+    result[1] = c0;
     
-    // Column 2
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(0, 2);
     MULADD(1, 1);
     MULADD(2, 0);
-    product[2] = c0;
+    result[2] = c0;
     
-    // Column 3
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(0, 3);
     MULADD(1, 2);
     MULADD(2, 1);
     MULADD(3, 0);
-    product[3] = c0;
+    result[3] = c0;
     
-    // Column 4
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(0, 4);
     MULADD(1, 3);
     MULADD(2, 2);
     MULADD(3, 1);
     MULADD(4, 0);
-    product[4] = c0;
-    
-    // Column 5
+    result[4] = c0;
+
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(0, 5);
     MULADD(1, 4);
@@ -233,9 +247,8 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     MULADD(3, 2);
     MULADD(4, 1);
     MULADD(5, 0);
-    product[5] = c0;
+    result[5] = c0;
     
-    // Column 6
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(0, 6);
     MULADD(1, 5);
@@ -244,9 +257,8 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     MULADD(4, 2);
     MULADD(5, 1);
     MULADD(6, 0);
-    product[6] = c0;
+    result[6] = c0;
     
-    // Column 7
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(0, 7);
     MULADD(1, 6);
@@ -256,9 +268,8 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     MULADD(5, 2);
     MULADD(6, 1);
     MULADD(7, 0);
-    product[7] = c0;
+    result[7] = c0;
     
-    // Column 8
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(1, 7);
     MULADD(2, 6);
@@ -267,9 +278,8 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     MULADD(5, 3);
     MULADD(6, 2);
     MULADD(7, 1);
-    product[8] = c0;
+    prod_high[0] = c0;
     
-    // Column 9
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(2, 7);
     MULADD(3, 6);
@@ -277,119 +287,202 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     MULADD(5, 4);
     MULADD(6, 3);
     MULADD(7, 2);
-    product[9] = c0;
+    prod_high[1] = c0;
     
-    // Column 10
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(3, 7);
     MULADD(4, 6);
     MULADD(5, 5);
     MULADD(6, 4);
     MULADD(7, 3);
-    product[10] = c0;
+    prod_high[2] = c0;
     
-    // Column 11
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(4, 7);
     MULADD(5, 6);
     MULADD(6, 5);
     MULADD(7, 4);
-    product[11] = c0;
+    prod_high[3] = c0;
     
-    // Column 12
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(5, 7);
     MULADD(6, 6);
     MULADD(7, 5);
-    product[12] = c0;
+    prod_high[4] = c0;
     
-    // Column 13
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(6, 7);
     MULADD(7, 6);
-    product[13] = c0;
+    prod_high[5] = c0;
     
-    // Column 14
     c0 = c1; c1 = c2; c2 = 0;
     MULADD(7, 7);
-    product[14] = c0;
+    prod_high[6] = c0;
     
-    // Column 15
-    product[15] = c1;
+    prod_high[7] = c1;
     
     #undef MULADD
     
-    // Initialize result with lower 8 words
-    uint32_t result[9];
-    #pragma unroll
-    for (int i = 0; i < BIGINT_WORDS; i++) {
-        result[i] = product[i];
-    }
-    result[8] = 0;
-    
-    // First reduction step: multiply upper words by 977 and add
-    uint64_t c = 0;
-    
-    #pragma unroll
-    for (int i = 0; i < BIGINT_WORDS; i++) {
-        uint32_t lo977, hi977;
-        asm volatile(
-            "mul.lo.u32 %0, %2, 977;\n\t"
-            "mul.hi.u32 %1, %2, 977;\n\t"
-            : "=r"(lo977), "=r"(hi977)
-            : "r"(product[8 + i])
-        );
-        
-        uint64_t sum = (uint64_t)result[i] + (uint64_t)lo977 + c;
-        result[i] = (uint32_t)sum;
-        c = (sum >> 32) + hi977;
-    }
-    
-    result[8] = (uint32_t)c;
-    
-    // Second reduction step: add upper words directly
-    c = 0;
-    
-    #pragma unroll
-    for (int i = 0; i < BIGINT_WORDS; i++) {
-        uint64_t sum = (uint64_t)result[i + 1] + (uint64_t)product[8 + i] + c;
-        result[i + 1] = (uint32_t)sum;
-        c = sum >> 32;
-    }
-    
-    // Handle final overflow
-    uint32_t overflow = result[8];
-    uint32_t has_overflow = (uint32_t)(-(int32_t)(overflow != 0));
     uint32_t lo977, hi977;
+    uint64_t sum, carry;
+    
     asm volatile(
         "mul.lo.u32 %0, %2, 977;\n\t"
-        "mul.hi.u32 %1, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
+        : "=r"(lo977), "=r"(hi977)
+        : "r"(prod_high[0])
+    );
+    sum = (uint64_t)result[0] + (uint64_t)lo977;
+    result[0] = (uint32_t)sum;
+    carry = (sum >> 32) + hi977;
+    
+    asm volatile(
+        "mul.lo.u32 %0, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
+        : "=r"(lo977), "=r"(hi977)
+        : "r"(prod_high[1])
+    );
+    sum = (uint64_t)result[1] + (uint64_t)lo977 + carry;
+    result[1] = (uint32_t)sum;
+    carry = (sum >> 32) + hi977;
+    
+    asm volatile(
+        "mul.lo.u32 %0, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
+        : "=r"(lo977), "=r"(hi977)
+        : "r"(prod_high[2])
+    );
+    sum = (uint64_t)result[2] + (uint64_t)lo977 + carry;
+    result[2] = (uint32_t)sum;
+    carry = (sum >> 32) + hi977;
+    
+    asm volatile(
+        "mul.lo.u32 %0, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
+        : "=r"(lo977), "=r"(hi977)
+        : "r"(prod_high[3])
+    );
+    sum = (uint64_t)result[3] + (uint64_t)lo977 + carry;
+    result[3] = (uint32_t)sum;
+    carry = (sum >> 32) + hi977;
+    
+    asm volatile(
+        "mul.lo.u32 %0, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
+        : "=r"(lo977), "=r"(hi977)
+        : "r"(prod_high[4])
+    );
+    sum = (uint64_t)result[4] + (uint64_t)lo977 + carry;
+    result[4] = (uint32_t)sum;
+    carry = (sum >> 32) + hi977;
+    
+    asm volatile(
+        "mul.lo.u32 %0, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
+        : "=r"(lo977), "=r"(hi977)
+        : "r"(prod_high[5])
+    );
+    sum = (uint64_t)result[5] + (uint64_t)lo977 + carry;
+    result[5] = (uint32_t)sum;
+    carry = (sum >> 32) + hi977;
+    
+    asm volatile(
+        "mul.lo.u32 %0, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
+        : "=r"(lo977), "=r"(hi977)
+        : "r"(prod_high[6])
+    );
+    sum = (uint64_t)result[6] + (uint64_t)lo977 + carry;
+    result[6] = (uint32_t)sum;
+    carry = (sum >> 32) + hi977;
+    
+    asm volatile(
+        "mul.lo.u32 %0, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
+        : "=r"(lo977), "=r"(hi977)
+        : "r"(prod_high[7])
+    );
+    sum = (uint64_t)result[7] + (uint64_t)lo977 + carry;
+    result[7] = (uint32_t)sum;
+    uint32_t overflow = (uint32_t)((sum >> 32) + hi977);
+    
+    carry = 0;
+
+    sum = (uint64_t)result[1] + (uint64_t)prod_high[0] + carry;
+    result[1] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[2] + (uint64_t)prod_high[1] + carry;
+    result[2] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[3] + (uint64_t)prod_high[2] + carry;
+    result[3] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[4] + (uint64_t)prod_high[3] + carry;
+    result[4] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[5] + (uint64_t)prod_high[4] + carry;
+    result[5] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[6] + (uint64_t)prod_high[5] + carry;
+    result[6] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[7] + (uint64_t)prod_high[6] + carry;
+    result[7] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    overflow += prod_high[7] + (uint32_t)carry;
+    
+    uint32_t has_overflow = (uint32_t)(-(int32_t)(overflow != 0));
+    asm volatile(
+        "mul.lo.u32 %0, %2, 977;\n\t"
+        "mul.hi.u32 %1, %2, 977;"
         : "=r"(lo977), "=r"(hi977)
         : "r"(overflow)
     );
     lo977 &= has_overflow;
     hi977 &= has_overflow;
     uint32_t masked_overflow = overflow & has_overflow;
+    
     uint64_t sum0 = (uint64_t)result[0] + (uint64_t)lo977;
     uint64_t sum1 = (uint64_t)result[1] + (uint64_t)masked_overflow + (sum0 >> 32) + hi977;
     result[0] = (uint32_t)sum0;
     result[1] = (uint32_t)sum1;
-    uint64_t carry = sum1 >> 32;
+    carry = sum1 >> 32;
     
-    #pragma unroll
-    for (int i = 2; i < BIGINT_WORDS; i++) {
-        uint64_t sum = (uint64_t)result[i] + carry;
-        result[i] = (uint32_t)sum;
-        carry = sum >> 32;
-    }
+    sum = (uint64_t)result[2] + carry;
+    result[2] = (uint32_t)sum;
+    carry = sum >> 32;
     
-    // Copy result to output
-    #pragma unroll
-    for (int i = 0; i < BIGINT_WORDS; i++) {
+    sum = (uint64_t)result[3] + carry;
+    result[3] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[4] + carry;
+    result[4] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[5] + carry;
+    result[5] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[6] + carry;
+    result[6] = (uint32_t)sum;
+    carry = sum >> 32;
+    
+    sum = (uint64_t)result[7] + carry;
+    result[7] = (uint32_t)sum;
+    
+    
+    for (int i = 0; i < 8; i++) {
         res->data[i] = result[i];
     }
     
-    // Final conditional subtraction
     uint32_t tmp[8];
     asm volatile(
         "sub.cc.u32 %0, %8, %16;\n\t"
@@ -412,10 +505,14 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     asm volatile("subc.u32 %0, 0, 0;" : "=r"(borrow));
     uint32_t mask = ~borrow;
     
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        res->data[i] = (tmp[i] & mask) | (res->data[i] & ~mask);
-    }
+    res->data[0] = (tmp[0] & mask) | (res->data[0] & ~mask);
+    res->data[1] = (tmp[1] & mask) | (res->data[1] & ~mask);
+    res->data[2] = (tmp[2] & mask) | (res->data[2] & ~mask);
+    res->data[3] = (tmp[3] & mask) | (res->data[3] & ~mask);
+    res->data[4] = (tmp[4] & mask) | (res->data[4] & ~mask);
+    res->data[5] = (tmp[5] & mask) | (res->data[5] & ~mask);
+    res->data[6] = (tmp[6] & mask) | (res->data[6] & ~mask);
+    res->data[7] = (tmp[7] & mask) | (res->data[7] & ~mask);
 }
 __device__ __forceinline__ void add_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
     uint32_t carry;
@@ -684,45 +781,116 @@ __device__ void double_point_jac(ECPointJac *R, const ECPointJac *P) {
 __device__ __forceinline__ void add_point_jac(ECPointJac *R, const ECPointJac *P, const ECPointJac *Q) {
     
     if (__builtin_expect(P->infinity, 0)) { 
-        point_copy_jac(R, Q); 
+        
+        uint4 *R_x = (uint4*)R->X.data;
+        uint4 *R_y = (uint4*)R->Y.data;
+        uint4 *R_z = (uint4*)R->Z.data;
+        const uint4 *Q_x = (const uint4*)Q->X.data;
+        const uint4 *Q_y = (const uint4*)Q->Y.data;
+        const uint4 *Q_z = (const uint4*)Q->Z.data;
+        
+        R_x[0] = Q_x[0]; R_x[1] = Q_x[1];
+        R_y[0] = Q_y[0]; R_y[1] = Q_y[1];
+        R_z[0] = Q_z[0]; R_z[1] = Q_z[1];
+        R->infinity = Q->infinity;
         return; 
     }
     if (__builtin_expect(Q->infinity, 0)) { 
-        point_copy_jac(R, P); 
+        uint4 *R_x = (uint4*)R->X.data;
+        uint4 *R_y = (uint4*)R->Y.data;
+        uint4 *R_z = (uint4*)R->Z.data;
+        const uint4 *P_x = (const uint4*)P->X.data;
+        const uint4 *P_y = (const uint4*)P->Y.data;
+        const uint4 *P_z = (const uint4*)P->Z.data;
+        
+        R_x[0] = P_x[0]; R_x[1] = P_x[1];
+        R_y[0] = P_y[0]; R_y[1] = P_y[1];
+        R_z[0] = P_z[0]; R_z[1] = P_z[1];
+        R->infinity = P->infinity;
         return; 
     }
     
-    union TempStorage {
-        struct {
-            BigInt Z1Z1, Z2Z2, U1, U2, H;
-            BigInt S1, S2, R_big, HH, HHH;
-        } vars;
-        BigInt temp_array[9];
-    } temp;
     
-    // Z1Z1 = Z1²
-    mul_mod_device(&temp.vars.Z1Z1, &P->Z, &P->Z);
-    // Z2Z2 = Z2²
-    mul_mod_device(&temp.vars.Z2Z2, &Q->Z, &Q->Z);
+    BigInt Z1Z1, Z2Z2, U1, U2, H, S1, S2, R_big;
+    BigInt HH, HHH, temp;
     
-    // U1 = X1·Z2²
-    mul_mod_device(&temp.vars.U1, &P->X, &temp.vars.Z2Z2);
-    // U2 = X2·Z1²
-    mul_mod_device(&temp.vars.U2, &Q->X, &temp.vars.Z1Z1);
     
-    // S1 = Y1·Z2³ = Y1·Z2²·Z2
-    mul_mod_device(&temp.vars.S1, &temp.vars.Z2Z2, &Q->Z);
-    mul_mod_device(&temp.vars.S1, &P->Y, &temp.vars.S1);
     
-    // S2 = Y2·Z1³ = Y2·Z1²·Z1
-    mul_mod_device(&temp.vars.S2, &temp.vars.Z1Z1, &P->Z);
-    mul_mod_device(&temp.vars.S2, &Q->Y, &temp.vars.S2);
     
-    // H = U2 - U1
-    sub_mod_device_fast(&temp.vars.H, &temp.vars.U2, &temp.vars.U1);
+    mul_mod_device(&Z1Z1, &P->Z, &P->Z);
+    mul_mod_device(&Z2Z2, &Q->Z, &Q->Z);
     
-    if (__builtin_expect(is_zero(&temp.vars.H), 0)) {
-        if (compare_bigint(&temp.vars.S1, &temp.vars.S2) != 0) {
+    
+    mul_mod_device(&U1, &P->X, &Z2Z2);
+    mul_mod_device(&U2, &Q->X, &Z1Z1);
+    
+    
+    
+    asm volatile(
+        "sub.cc.u32 %0, %8, %16;\n\t"
+        "subc.cc.u32 %1, %9, %17;\n\t"
+        "subc.cc.u32 %2, %10, %18;\n\t"
+        "subc.cc.u32 %3, %11, %19;\n\t"
+        "subc.cc.u32 %4, %12, %20;\n\t"
+        "subc.cc.u32 %5, %13, %21;\n\t"
+        "subc.cc.u32 %6, %14, %22;\n\t"
+        "subc.cc.u32 %7, %15, %23;\n\t"
+        : "=r"(H.data[0]), "=r"(H.data[1]), "=r"(H.data[2]), "=r"(H.data[3]),
+          "=r"(H.data[4]), "=r"(H.data[5]), "=r"(H.data[6]), "=r"(H.data[7])
+        : "r"(U2.data[0]), "r"(U2.data[1]), "r"(U2.data[2]), "r"(U2.data[3]),
+          "r"(U2.data[4]), "r"(U2.data[5]), "r"(U2.data[6]), "r"(U2.data[7]),
+          "r"(U1.data[0]), "r"(U1.data[1]), "r"(U1.data[2]), "r"(U1.data[3]),
+          "r"(U1.data[4]), "r"(U1.data[5]), "r"(U1.data[6]), "r"(U1.data[7])
+    );
+    
+    
+    uint32_t borrow;
+    asm volatile("subc.u32 %0, 0, 0;" : "=r"(borrow));
+    if (borrow) {
+        asm volatile(
+            "add.cc.u32 %0, %0, %8;\n\t"
+            "addc.cc.u32 %1, %1, %9;\n\t"
+            "addc.cc.u32 %2, %2, %10;\n\t"
+            "addc.cc.u32 %3, %3, %11;\n\t"
+            "addc.cc.u32 %4, %4, %12;\n\t"
+            "addc.cc.u32 %5, %5, %13;\n\t"
+            "addc.cc.u32 %6, %6, %14;\n\t"
+            "addc.u32 %7, %7, %15;\n\t"
+            : "+r"(H.data[0]), "+r"(H.data[1]), "+r"(H.data[2]), "+r"(H.data[3]),
+              "+r"(H.data[4]), "+r"(H.data[5]), "+r"(H.data[6]), "+r"(H.data[7])
+            : "r"(const_p.data[0]), "r"(const_p.data[1]), "r"(const_p.data[2]), "r"(const_p.data[3]),
+              "r"(const_p.data[4]), "r"(const_p.data[5]), "r"(const_p.data[6]), "r"(const_p.data[7])
+        );
+    }
+    
+    
+    uint32_t h_check;
+    asm volatile(
+        "{\n\t"
+        ".reg .u32 t0, t1, t2, t3;\n\t"
+        "or.b32 t0, %1, %2;\n\t"
+        "or.b32 t1, %3, %4;\n\t"
+        "or.b32 t2, %5, %6;\n\t"
+        "or.b32 t3, %7, %8;\n\t"
+        "or.b32 t0, t0, t1;\n\t"
+        "or.b32 t2, t2, t3;\n\t"
+        "or.b32 %0, t0, t2;\n\t"
+        "}"
+        : "=r"(h_check)
+        : "r"(H.data[0]), "r"(H.data[1]), "r"(H.data[2]), "r"(H.data[3]),
+          "r"(H.data[4]), "r"(H.data[5]), "r"(H.data[6]), "r"(H.data[7])
+    );
+    
+    
+    if (__builtin_expect(h_check == 0, 0)) {
+        BigInt Z1Z1Z1, Z2Z2Z2;
+        
+        mul_mod_device(&Z1Z1Z1, &Z1Z1, &P->Z);
+        mul_mod_device(&Z2Z2Z2, &Z2Z2, &Q->Z);
+        mul_mod_device(&S1, &P->Y, &Z2Z2Z2);
+        mul_mod_device(&S2, &Q->Y, &Z1Z1Z1);
+        
+        if (compare_bigint(&S1, &S2) != 0) {
             point_set_infinity_jac(R);
         } else {
             double_point_jac(R, P);
@@ -730,37 +898,172 @@ __device__ __forceinline__ void add_point_jac(ECPointJac *R, const ECPointJac *P
         return;
     }
     
-    // r = S2 - S1
-    sub_mod_device_fast(&temp.vars.R_big, &temp.vars.S2, &temp.vars.S1);
     
-    // HH = H²
-    mul_mod_device(&temp.vars.HH, &temp.vars.H, &temp.vars.H);
-    // HHH = H³
-    mul_mod_device(&temp.vars.HHH, &temp.vars.HH, &temp.vars.H);
+    mul_mod_device(&temp, &Z2Z2, &Q->Z);
+    mul_mod_device(&S1, &P->Y, &temp);
     
-    // V = U1·HH (reuse U2 for V)
-    mul_mod_device(&temp.vars.U2, &temp.vars.U1, &temp.vars.HH);
+    mul_mod_device(&temp, &Z1Z1, &P->Z);
+    mul_mod_device(&S2, &Q->Y, &temp);
     
-    // X3 = r² - HHH - 2V
-    mul_mod_device(&R->X, &temp.vars.R_big, &temp.vars.R_big);
-    sub_mod_device_fast(&R->X, &R->X, &temp.vars.HHH);
-    sub_mod_device_fast(&R->X, &R->X, &temp.vars.U2);
-    sub_mod_device_fast(&R->X, &R->X, &temp.vars.U2);
     
-    // Y3 = r·(V - X3) - S1·HHH
-    sub_mod_device_fast(&temp.vars.U1, &temp.vars.U2, &R->X);
-    mul_mod_device(&temp.vars.U1, &temp.vars.R_big, &temp.vars.U1);
-    mul_mod_device(&temp.vars.S1, &temp.vars.S1, &temp.vars.HHH);
-    sub_mod_device_fast(&R->Y, &temp.vars.U1, &temp.vars.S1);
+    asm volatile(
+        "sub.cc.u32 %0, %8, %16;\n\t"
+        "subc.cc.u32 %1, %9, %17;\n\t"
+        "subc.cc.u32 %2, %10, %18;\n\t"
+        "subc.cc.u32 %3, %11, %19;\n\t"
+        "subc.cc.u32 %4, %12, %20;\n\t"
+        "subc.cc.u32 %5, %13, %21;\n\t"
+        "subc.cc.u32 %6, %14, %22;\n\t"
+        "subc.cc.u32 %7, %15, %23;\n\t"
+        : "=r"(R_big.data[0]), "=r"(R_big.data[1]), "=r"(R_big.data[2]), "=r"(R_big.data[3]),
+          "=r"(R_big.data[4]), "=r"(R_big.data[5]), "=r"(R_big.data[6]), "=r"(R_big.data[7])
+        : "r"(S2.data[0]), "r"(S2.data[1]), "r"(S2.data[2]), "r"(S2.data[3]),
+          "r"(S2.data[4]), "r"(S2.data[5]), "r"(S2.data[6]), "r"(S2.data[7]),
+          "r"(S1.data[0]), "r"(S1.data[1]), "r"(S1.data[2]), "r"(S1.data[3]),
+          "r"(S1.data[4]), "r"(S1.data[5]), "r"(S1.data[6]), "r"(S1.data[7])
+    );
     
-    // Z3 = Z1·Z2·H
+    asm volatile("subc.u32 %0, 0, 0;" : "=r"(borrow));
+    if (borrow) {
+        asm volatile(
+            "add.cc.u32 %0, %0, %8;\n\t"
+            "addc.cc.u32 %1, %1, %9;\n\t"
+            "addc.cc.u32 %2, %2, %10;\n\t"
+            "addc.cc.u32 %3, %3, %11;\n\t"
+            "addc.cc.u32 %4, %4, %12;\n\t"
+            "addc.cc.u32 %5, %5, %13;\n\t"
+            "addc.cc.u32 %6, %6, %14;\n\t"
+            "addc.u32 %7, %7, %15;\n\t"
+            : "+r"(R_big.data[0]), "+r"(R_big.data[1]), "+r"(R_big.data[2]), "+r"(R_big.data[3]),
+              "+r"(R_big.data[4]), "+r"(R_big.data[5]), "+r"(R_big.data[6]), "+r"(R_big.data[7])
+            : "r"(const_p.data[0]), "r"(const_p.data[1]), "r"(const_p.data[2]), "r"(const_p.data[3]),
+              "r"(const_p.data[4]), "r"(const_p.data[5]), "r"(const_p.data[6]), "r"(const_p.data[7])
+        );
+    }
+    
+    
+    mul_mod_device(&HH, &H, &H);
+    mul_mod_device(&HHH, &HH, &H);
+    
+    
+    mul_mod_device(&U2, &U1, &HH);  
+    
+    
+    mul_mod_device(&R->X, &R_big, &R_big);
+    
+    
+    asm volatile(
+        "sub.cc.u32 %0, %0, %8;\n\t"
+        "subc.cc.u32 %1, %1, %9;\n\t"
+        "subc.cc.u32 %2, %2, %10;\n\t"
+        "subc.cc.u32 %3, %3, %11;\n\t"
+        "subc.cc.u32 %4, %4, %12;\n\t"
+        "subc.cc.u32 %5, %5, %13;\n\t"
+        "subc.cc.u32 %6, %6, %14;\n\t"
+        "subc.cc.u32 %7, %7, %15;\n\t"
+        : "+r"(R->X.data[0]), "+r"(R->X.data[1]), "+r"(R->X.data[2]), "+r"(R->X.data[3]),
+          "+r"(R->X.data[4]), "+r"(R->X.data[5]), "+r"(R->X.data[6]), "+r"(R->X.data[7])
+        : "r"(HHH.data[0]), "r"(HHH.data[1]), "r"(HHH.data[2]), "r"(HHH.data[3]),
+          "r"(HHH.data[4]), "r"(HHH.data[5]), "r"(HHH.data[6]), "r"(HHH.data[7])
+    );
+    asm volatile("subc.u32 %0, 0, 0;" : "=r"(borrow));
+    if (borrow) {
+        ptx_u256Add(&R->X, &R->X, &const_p);
+    }
+    
+    
+    asm volatile(
+        "sub.cc.u32 %0, %0, %8;\n\t"
+        "subc.cc.u32 %1, %1, %9;\n\t"
+        "subc.cc.u32 %2, %2, %10;\n\t"
+        "subc.cc.u32 %3, %3, %11;\n\t"
+        "subc.cc.u32 %4, %4, %12;\n\t"
+        "subc.cc.u32 %5, %5, %13;\n\t"
+        "subc.cc.u32 %6, %6, %14;\n\t"
+        "subc.cc.u32 %7, %7, %15;\n\t"
+        : "+r"(R->X.data[0]), "+r"(R->X.data[1]), "+r"(R->X.data[2]), "+r"(R->X.data[3]),
+          "+r"(R->X.data[4]), "+r"(R->X.data[5]), "+r"(R->X.data[6]), "+r"(R->X.data[7])
+        : "r"(U2.data[0]), "r"(U2.data[1]), "r"(U2.data[2]), "r"(U2.data[3]),
+          "r"(U2.data[4]), "r"(U2.data[5]), "r"(U2.data[6]), "r"(U2.data[7])
+    );
+    asm volatile("subc.u32 %0, 0, 0;" : "=r"(borrow));
+    if (borrow) {
+        ptx_u256Add(&R->X, &R->X, &const_p);
+    }
+    
+    
+    asm volatile(
+        "sub.cc.u32 %0, %0, %8;\n\t"
+        "subc.cc.u32 %1, %1, %9;\n\t"
+        "subc.cc.u32 %2, %2, %10;\n\t"
+        "subc.cc.u32 %3, %3, %11;\n\t"
+        "subc.cc.u32 %4, %4, %12;\n\t"
+        "subc.cc.u32 %5, %5, %13;\n\t"
+        "subc.cc.u32 %6, %6, %14;\n\t"
+        "subc.cc.u32 %7, %7, %15;\n\t"
+        : "+r"(R->X.data[0]), "+r"(R->X.data[1]), "+r"(R->X.data[2]), "+r"(R->X.data[3]),
+          "+r"(R->X.data[4]), "+r"(R->X.data[5]), "+r"(R->X.data[6]), "+r"(R->X.data[7])
+        : "r"(U2.data[0]), "r"(U2.data[1]), "r"(U2.data[2]), "r"(U2.data[3]),
+          "r"(U2.data[4]), "r"(U2.data[5]), "r"(U2.data[6]), "r"(U2.data[7])
+    );
+    asm volatile("subc.u32 %0, 0, 0;" : "=r"(borrow));
+    if (borrow) {
+        ptx_u256Add(&R->X, &R->X, &const_p);
+    }
+    
+    
+    
+    asm volatile(
+        "sub.cc.u32 %0, %8, %16;\n\t"
+        "subc.cc.u32 %1, %9, %17;\n\t"
+        "subc.cc.u32 %2, %10, %18;\n\t"
+        "subc.cc.u32 %3, %11, %19;\n\t"
+        "subc.cc.u32 %4, %12, %20;\n\t"
+        "subc.cc.u32 %5, %13, %21;\n\t"
+        "subc.cc.u32 %6, %14, %22;\n\t"
+        "subc.cc.u32 %7, %15, %23;\n\t"
+        : "=r"(temp.data[0]), "=r"(temp.data[1]), "=r"(temp.data[2]), "=r"(temp.data[3]),
+          "=r"(temp.data[4]), "=r"(temp.data[5]), "=r"(temp.data[6]), "=r"(temp.data[7])
+        : "r"(U2.data[0]), "r"(U2.data[1]), "r"(U2.data[2]), "r"(U2.data[3]),
+          "r"(U2.data[4]), "r"(U2.data[5]), "r"(U2.data[6]), "r"(U2.data[7]),
+          "r"(R->X.data[0]), "r"(R->X.data[1]), "r"(R->X.data[2]), "r"(R->X.data[3]),
+          "r"(R->X.data[4]), "r"(R->X.data[5]), "r"(R->X.data[6]), "r"(R->X.data[7])
+    );
+    asm volatile("subc.u32 %0, 0, 0;" : "=r"(borrow));
+    if (borrow) {
+        ptx_u256Add(&temp, &temp, &const_p);
+    }
+    
+    mul_mod_device(&temp, &R_big, &temp);
+    mul_mod_device(&S1, &S1, &HHH);
+    
+    
+    asm volatile(
+        "sub.cc.u32 %0, %8, %16;\n\t"
+        "subc.cc.u32 %1, %9, %17;\n\t"
+        "subc.cc.u32 %2, %10, %18;\n\t"
+        "subc.cc.u32 %3, %11, %19;\n\t"
+        "subc.cc.u32 %4, %12, %20;\n\t"
+        "subc.cc.u32 %5, %13, %21;\n\t"
+        "subc.cc.u32 %6, %14, %22;\n\t"
+        "subc.cc.u32 %7, %15, %23;\n\t"
+        : "=r"(R->Y.data[0]), "=r"(R->Y.data[1]), "=r"(R->Y.data[2]), "=r"(R->Y.data[3]),
+          "=r"(R->Y.data[4]), "=r"(R->Y.data[5]), "=r"(R->Y.data[6]), "=r"(R->Y.data[7])
+        : "r"(temp.data[0]), "r"(temp.data[1]), "r"(temp.data[2]), "r"(temp.data[3]),
+          "r"(temp.data[4]), "r"(temp.data[5]), "r"(temp.data[6]), "r"(temp.data[7]),
+          "r"(S1.data[0]), "r"(S1.data[1]), "r"(S1.data[2]), "r"(S1.data[3]),
+          "r"(S1.data[4]), "r"(S1.data[5]), "r"(S1.data[6]), "r"(S1.data[7])
+    );
+    asm volatile("subc.u32 %0, 0, 0;" : "=r"(borrow));
+    if (borrow) {
+        ptx_u256Add(&R->Y, &R->Y, &const_p);
+    }
+    
     mul_mod_device(&R->Z, &P->Z, &Q->Z);
-    mul_mod_device(&R->Z, &R->Z, &temp.vars.H);
+    mul_mod_device(&R->Z, &R->Z, &H);
     
     R->infinity = false;
 }
-
-
 __constant__ uint32_t c_K[64] = {
     0x428a2f98ul,0x71374491ul,0xb5c0fbcful,0xe9b5dba5ul,
     0x3956c25bul,0x59f111f1ul,0x923f82a4ul,0xab1c5ed5ul,
@@ -780,11 +1083,9 @@ __constant__ uint32_t c_K[64] = {
     0x90befffaul,0xa4506cebul,0xbef9a3f7ul,0xc67178f2ul
 };
 
-
 __device__ __forceinline__ uint32_t rotr(uint32_t x, int n) {
-    return (x >> n) | (x << (32 - n));
+    return __funnelshift_rc(x, x, n);
 }
-
 
 __device__ __forceinline__ uint32_t Ch(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (~x & z);
@@ -810,66 +1111,86 @@ __device__ __forceinline__ uint32_t sigma1(uint32_t x) {
     return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10);
 }
 
-__device__ void sha256(const uint8_t* data, int len, uint8_t hash[32]) {
-    uint32_t h0 = 0x6a09e667ul, h1 = 0xbb67ae85ul, h2 = 0x3c6ef372ul, h3 = 0xa54ff53aul;
-    uint32_t h4 = 0x510e527ful, h5 = 0x9b05688cul, h6 = 0x1f83d9abul, h7 = 0x5be0cd19ul;
+__device__ __forceinline__ void sha256(const uint8_t* data, int len, uint8_t hash[32]) {
     
-    uint32_t w[64];
-    const uint32_t* data32 = (const uint32_t*)data;
-    int len_aligned = len & ~3;
-    
-    // Load first 16 words using vectorized access
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        int offset = i * 4;
-        if (offset < len_aligned) {
-            w[i] = __byte_perm(data32[i], 0, 0x0123);
-        } else if (offset < len) {
-            uint32_t val = 0;
-            #pragma unroll
-            for (int j = 0; j < 4 && offset + j < len; ++j) {
-                val |= ((uint32_t)data[offset + j]) << (24 - j * 8);
-            }
-            if (offset + 4 > len) val |= 0x80u << (24 - (len - offset) * 8);
-            w[i] = val;
-        } else if (offset == len) {
-            w[i] = 0x80000000u;
-        } else {
-            w[i] = (i == 15) ? (uint32_t)(len * 8) : 0;
-        }
-    }
-    
-    // Message schedule with reduced dependencies
-    #pragma unroll
-    for (int i = 16; i < 64; ++i) {
-        uint32_t s0 = sigma0(w[i - 15]);
-        uint32_t s1 = sigma1(w[i - 2]);
-        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
-    
-    uint32_t a = h0, b = h1, c = h2, d = h3;
-    uint32_t e = h4, f = h5, g = h6, h = h7;
-    
-    // Compression with partial unrolling for better register usage
-    #pragma unroll
-    for (int i = 0; i < 64; ++i) {
-        uint32_t s1 = Sigma1(e);
-        uint32_t ch = Ch(e, f, g);
-        uint32_t temp1 = h + s1 + ch + c_K[i] + w[i];
-        uint32_t s0 = Sigma0(a);
-        uint32_t maj = Maj(a, b, c);
-        uint32_t temp2 = s0 + maj;
+    uint32_t h0 = 0x6a09e667ul;
+    uint32_t h1 = 0xbb67ae85ul;
+    uint32_t h2 = 0x3c6ef372ul;
+    uint32_t h3 = 0xa54ff53aul;
+    uint32_t h4 = 0x510e527ful;
+    uint32_t h5 = 0x9b05688cul;
+    uint32_t h6 = 0x1f83d9abul;
+    uint32_t h7 = 0x5be0cd19ul;
+
+    uint32_t a = h0;
+    uint32_t b = h1;
+    uint32_t c = h2;
+    uint32_t d = h3;
+    uint32_t e = h4;
+    uint32_t f = h5;
+    uint32_t g = h6;
+    uint32_t h = h7;
+
+    uint32_t w[16];
+
+    for (int i = 0; i < 16; i++) {
+        int off = i * 4;
+        uint32_t val = 0;
         
-        h = g; g = f; f = e;
-        e = d + temp1;
-        d = c; c = b; b = a;
-        a = temp1 + temp2;
+        if (off < len) val |= ((uint32_t)data[off]) << 24;
+        if (off + 1 < len) val |= ((uint32_t)data[off + 1]) << 16;
+        if (off + 2 < len) val |= ((uint32_t)data[off + 2]) << 8;
+        if (off + 3 < len) val |= ((uint32_t)data[off + 3]);
+        
+        if (off <= len && len < off + 4) {
+            int pad_pos = len - off;
+            val |= 0x80u << (24 - pad_pos * 8);
+        }
+        
+        if (i == 14) {
+            val = 0;
+        }
+        if (i == 15) {
+            val = len * 8;
+        }
+        
+        w[i] = val;
     }
-    
-    h0 += a; h1 += b; h2 += c; h3 += d;
-    h4 += e; h5 += f; h6 += g; h7 += h;
-    
-    // Direct write output
+
+    #define ROUND(wi, ki) { \
+        uint32_t t1 = h + Sigma1(e) + Ch(e, f, g) + ki + wi; \
+        uint32_t t2 = Sigma0(a) + Maj(a, b, c); \
+        h = g; g = f; f = e; e = d + t1; \
+        d = c; c = b; b = a; a = t1 + t2; \
+    }
+
+    ROUND(w[0], c_K[0]); ROUND(w[1], c_K[1]); ROUND(w[2], c_K[2]); ROUND(w[3], c_K[3]);
+    ROUND(w[4], c_K[4]); ROUND(w[5], c_K[5]); ROUND(w[6], c_K[6]); ROUND(w[7], c_K[7]);
+    ROUND(w[8], c_K[8]); ROUND(w[9], c_K[9]); ROUND(w[10], c_K[10]); ROUND(w[11], c_K[11]);
+    ROUND(w[12], c_K[12]); ROUND(w[13], c_K[13]); ROUND(w[14], c_K[14]); ROUND(w[15], c_K[15]);
+
+    #define EXTEND_ROUND(i) { \
+        uint32_t s0 = sigma0(w[(i-15) & 15]); \
+        uint32_t s1 = sigma1(w[(i-2) & 15]); \
+        w[i & 15] = w[(i-16) & 15] + s0 + w[(i-7) & 15] + s1; \
+        ROUND(w[i & 15], c_K[i]); \
+    }
+
+    EXTEND_ROUND(16); EXTEND_ROUND(17); EXTEND_ROUND(18); EXTEND_ROUND(19);
+    EXTEND_ROUND(20); EXTEND_ROUND(21); EXTEND_ROUND(22); EXTEND_ROUND(23);
+    EXTEND_ROUND(24); EXTEND_ROUND(25); EXTEND_ROUND(26); EXTEND_ROUND(27);
+    EXTEND_ROUND(28); EXTEND_ROUND(29); EXTEND_ROUND(30); EXTEND_ROUND(31);
+    EXTEND_ROUND(32); EXTEND_ROUND(33); EXTEND_ROUND(34); EXTEND_ROUND(35);
+    EXTEND_ROUND(36); EXTEND_ROUND(37); EXTEND_ROUND(38); EXTEND_ROUND(39);
+    EXTEND_ROUND(40); EXTEND_ROUND(41); EXTEND_ROUND(42); EXTEND_ROUND(43);
+    EXTEND_ROUND(44); EXTEND_ROUND(45); EXTEND_ROUND(46); EXTEND_ROUND(47);
+    EXTEND_ROUND(48); EXTEND_ROUND(49); EXTEND_ROUND(50); EXTEND_ROUND(51);
+    EXTEND_ROUND(52); EXTEND_ROUND(53); EXTEND_ROUND(54); EXTEND_ROUND(55);
+    EXTEND_ROUND(56); EXTEND_ROUND(57); EXTEND_ROUND(58); EXTEND_ROUND(59);
+    EXTEND_ROUND(60); EXTEND_ROUND(61); EXTEND_ROUND(62); EXTEND_ROUND(63);
+
+    h0 += a; h1 += b; h2 += c; h3 += d; h4 += e; h5 += f; h6 += g; h7 += h;
+
     uint32_t* out = (uint32_t*)hash;
     out[0] = __byte_perm(h0, 0, 0x0123);
     out[1] = __byte_perm(h1, 0, 0x0123);
@@ -880,44 +1201,19 @@ __device__ void sha256(const uint8_t* data, int len, uint8_t hash[32]) {
     out[6] = __byte_perm(h6, 0, 0x0123);
     out[7] = __byte_perm(h7, 0, 0x0123);
 }
-
-
-
-
-__constant__ uint32_t c_K1[5] = {0x00000000, 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xA953FD4E};
-__constant__ uint32_t c_K2[5] = {0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000};
-
-__constant__ int c_ZL[80] = {
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    7, 4, 13, 1, 10, 6, 15, 3, 12, 0, 9, 5, 2, 14, 11, 8,
-    3, 10, 14, 4, 9, 15, 8, 1, 2, 7, 0, 6, 13, 11, 5, 12,
-    1, 9, 11, 10, 0, 8, 12, 4, 13, 3, 7, 15, 14, 5, 6, 2,
-    4, 0, 5, 9, 7, 12, 2, 10, 14, 1, 3, 8, 11, 6, 15, 13
-};
-
-__constant__ int c_ZR[80] = {
-    5, 14, 7, 0, 9, 2, 11, 4, 13, 6, 15, 8, 1, 10, 3, 12,
-    6, 11, 3, 7, 0, 13, 5, 10, 14, 15, 8, 12, 4, 9, 1, 2,
-    15, 5, 1, 3, 7, 14, 6, 9, 11, 8, 12, 2, 10, 0, 4, 13,
-    8, 6, 4, 1, 3, 11, 15, 0, 5, 12, 2, 13, 9, 7, 10, 14,
-    12, 15, 10, 4, 1, 5, 8, 7, 6, 2, 13, 14, 0, 3, 9, 11
-};
-
-__constant__ int c_SL[80] = {
-    11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8,
-    7, 6, 8, 13, 11, 9, 7, 15, 7, 12, 15, 9, 11, 7, 13, 12,
-    11, 13, 6, 7, 14, 9, 13, 15, 14, 8, 13, 6, 5, 12, 7, 5,
-    11, 12, 14, 15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6, 5, 12,
-    9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11, 8, 5, 6
-};
-
-__constant__ int c_SR[80] = {
-    8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6,
-    9, 13, 15, 7, 12, 8, 9, 11, 7, 7, 12, 7, 6, 15, 13, 11,
-    9, 7, 15, 11, 8, 6, 6, 14, 12, 13, 5, 14, 13, 13, 7, 5,
-    15, 5, 8, 11, 14, 14, 6, 14, 6, 9, 12, 9, 12, 5, 15, 8,
-    8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11
-};
+#define R2(aL,bL,cL,dL,eL,fL,xL,sL,kL, aR,bR,cR,dR,eR,fR,xR,sR,kR) \
+	{ \
+		uint32_t tL = aL + fL(bL,cL,dL) + xL + kL; \
+		uint32_t tR = aR + fR(bR,cR,dR) + xR + kR; \
+		uint32_t cL10 = __funnelshift_lc(cL,cL,10); \
+		uint32_t cR10 = __funnelshift_lc(cR,cR,10); \
+		aL = eL; aR = eR; \
+		eL = dL; eR = dR; \
+		dL = cL10; dR = cR10; \
+		cL = bL; cR = bR; \
+		bL = __funnelshift_lc(tL,tL,sL) + aL; \
+		bR = __funnelshift_lc(tR,tR,sR) + aR; \
+	}
 
 
 __device__ __forceinline__ uint32_t F(uint32_t x, uint32_t y, uint32_t z) {
@@ -940,102 +1236,108 @@ __device__ __forceinline__ uint32_t J(uint32_t x, uint32_t y, uint32_t z) {
     return x ^ (y | ~z);
 }
 
-__device__ __forceinline__ uint32_t ROL(uint32_t x, int n) {
-    return (x << n) | (x >> (32 - n));
-}
-
-
-#define ROUND(a, b, c, d, e, func, x, s, k) \
-    do { \
-        uint32_t t = a + func(b, c, d) + x + k; \
-        t = ROL(t, s) + e; \
-        a = e; \
-        e = d; \
-        d = ROL(c, 10); \
-        c = b; \
-        b = t; \
-    } while(0)
 __device__ void ripemd160(const uint8_t* __restrict__ msg, 
                           uint8_t* __restrict__ out) {
-    // Vector load input
+    
     const uint32_t* msg32 = reinterpret_cast<const uint32_t*>(msg);
-    uint32_t X[16];
     
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        X[i] = msg32[i];
-    }
-    
-    X[8] = 0x80; X[9] = 0; X[10] = 0; X[11] = 0;
-    X[12] = 0; X[13] = 0; X[14] = 256; X[15] = 0;
+    uint32_t X0 = msg32[0], X1 = msg32[1], X2 = msg32[2], X3 = msg32[3];
+    uint32_t X4 = msg32[4], X5 = msg32[5], X6 = msg32[6], X7 = msg32[7];
+    uint32_t X8 = 0x80, X9 = 0, X10 = 0, X11 = 0;
+    uint32_t X12 = 0, X13 = 0, X14 = 256, X15 = 0;
     
     uint32_t AL = 0x67452301, BL = 0xEFCDAB89, CL = 0x98BADCFE;
     uint32_t DL = 0x10325476, EL = 0xC3D2E1F0;
-    uint32_t AR = AL, BR = BL, CR = CL, DR = DL, ER = EL;
- 
-    for (int j = 0; j < 16; j++) {
-        ROUND(AL, BL, CL, DL, EL, F, X[c_ZL[j]], c_SL[j], c_K1[0]);
-    }
+    uint32_t AR = 0x67452301, BR = 0xEFCDAB89, CR = 0x98BADCFE;
+    uint32_t DR = 0x10325476, ER = 0xC3D2E1F0;
     
+    R2(AL,BL,CL,DL,EL,F,X0,11,0, AR,BR,CR,DR,ER,J,X5,8,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X1,14,0, AR,BR,CR,DR,ER,J,X14,9,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X2,15,0, AR,BR,CR,DR,ER,J,X7,9,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X3,12,0, AR,BR,CR,DR,ER,J,X0,11,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X4,5,0, AR,BR,CR,DR,ER,J,X9,13,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X5,8,0, AR,BR,CR,DR,ER,J,X2,15,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X6,7,0, AR,BR,CR,DR,ER,J,X11,15,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X7,9,0, AR,BR,CR,DR,ER,J,X4,5,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X8,11,0, AR,BR,CR,DR,ER,J,X13,7,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X9,13,0, AR,BR,CR,DR,ER,J,X6,7,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X10,14,0, AR,BR,CR,DR,ER,J,X15,8,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X11,15,0, AR,BR,CR,DR,ER,J,X8,11,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X12,6,0, AR,BR,CR,DR,ER,J,X1,14,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X13,7,0, AR,BR,CR,DR,ER,J,X10,14,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X14,9,0, AR,BR,CR,DR,ER,J,X3,12,0x50A28BE6);
+    R2(AL,BL,CL,DL,EL,F,X15,8,0, AR,BR,CR,DR,ER,J,X12,6,0x50A28BE6);
     
+    R2(AL,BL,CL,DL,EL,G,X7,7,0x5A827999, AR,BR,CR,DR,ER,I,X6,9,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X4,6,0x5A827999, AR,BR,CR,DR,ER,I,X11,13,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X13,8,0x5A827999, AR,BR,CR,DR,ER,I,X3,15,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X1,13,0x5A827999, AR,BR,CR,DR,ER,I,X7,7,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X10,11,0x5A827999, AR,BR,CR,DR,ER,I,X0,12,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X6,9,0x5A827999, AR,BR,CR,DR,ER,I,X13,8,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X15,7,0x5A827999, AR,BR,CR,DR,ER,I,X5,9,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X3,15,0x5A827999, AR,BR,CR,DR,ER,I,X10,11,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X12,7,0x5A827999, AR,BR,CR,DR,ER,I,X14,7,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X0,12,0x5A827999, AR,BR,CR,DR,ER,I,X15,7,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X9,15,0x5A827999, AR,BR,CR,DR,ER,I,X8,12,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X5,9,0x5A827999, AR,BR,CR,DR,ER,I,X12,7,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X2,11,0x5A827999, AR,BR,CR,DR,ER,I,X4,6,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X14,7,0x5A827999, AR,BR,CR,DR,ER,I,X9,15,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X11,13,0x5A827999, AR,BR,CR,DR,ER,I,X1,13,0x5C4DD124);
+    R2(AL,BL,CL,DL,EL,G,X8,12,0x5A827999, AR,BR,CR,DR,ER,I,X2,11,0x5C4DD124);
     
-    for (int j = 16; j < 32; j++) {
-        ROUND(AL, BL, CL, DL, EL, G, X[c_ZL[j]], c_SL[j], c_K1[1]);
-    }
+    R2(AL,BL,CL,DL,EL,H,X3,11,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X15,9,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X10,13,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X5,7,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X14,6,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X1,15,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X4,7,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X3,11,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X9,14,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X7,8,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X15,9,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X14,6,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X8,13,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X6,6,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X1,15,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X9,14,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X2,14,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X11,12,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X7,8,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X8,13,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X0,13,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X12,5,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X6,6,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X2,14,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X13,5,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X10,13,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X11,12,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X0,13,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X5,7,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X4,7,0x6D703EF3);
+    R2(AL,BL,CL,DL,EL,H,X12,5,0x6ED9EBA1, AR,BR,CR,DR,ER,H,X13,5,0x6D703EF3);
     
+    R2(AL,BL,CL,DL,EL,I,X1,11,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X8,15,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X9,12,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X6,5,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X11,14,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X4,8,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X10,15,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X1,11,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X0,14,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X3,14,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X8,15,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X11,14,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X12,9,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X15,6,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X4,8,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X0,14,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X13,9,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X5,6,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X3,14,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X12,9,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X7,5,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X2,12,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X15,6,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X13,9,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X14,8,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X9,12,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X5,6,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X7,5,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X6,5,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X10,15,0x7A6D76E9);
+    R2(AL,BL,CL,DL,EL,I,X2,12,0x8F1BBCDC, AR,BR,CR,DR,ER,G,X14,8,0x7A6D76E9);
     
+    R2(AL,BL,CL,DL,EL,J,X4,9,0xA953FD4E, AR,BR,CR,DR,ER,F,X12,8,0);
+    R2(AL,BL,CL,DL,EL,J,X0,15,0xA953FD4E, AR,BR,CR,DR,ER,F,X15,5,0);
+    R2(AL,BL,CL,DL,EL,J,X5,5,0xA953FD4E, AR,BR,CR,DR,ER,F,X10,12,0);
+    R2(AL,BL,CL,DL,EL,J,X9,11,0xA953FD4E, AR,BR,CR,DR,ER,F,X4,9,0);
+    R2(AL,BL,CL,DL,EL,J,X7,6,0xA953FD4E, AR,BR,CR,DR,ER,F,X1,12,0);
+    R2(AL,BL,CL,DL,EL,J,X12,8,0xA953FD4E, AR,BR,CR,DR,ER,F,X5,5,0);
+    R2(AL,BL,CL,DL,EL,J,X2,13,0xA953FD4E, AR,BR,CR,DR,ER,F,X8,14,0);
+    R2(AL,BL,CL,DL,EL,J,X10,12,0xA953FD4E, AR,BR,CR,DR,ER,F,X7,6,0);
+    R2(AL,BL,CL,DL,EL,J,X14,5,0xA953FD4E, AR,BR,CR,DR,ER,F,X6,8,0);
+    R2(AL,BL,CL,DL,EL,J,X1,12,0xA953FD4E, AR,BR,CR,DR,ER,F,X2,13,0);
+    R2(AL,BL,CL,DL,EL,J,X3,13,0xA953FD4E, AR,BR,CR,DR,ER,F,X13,6,0);
+    R2(AL,BL,CL,DL,EL,J,X8,14,0xA953FD4E, AR,BR,CR,DR,ER,F,X14,5,0);
+    R2(AL,BL,CL,DL,EL,J,X11,11,0xA953FD4E, AR,BR,CR,DR,ER,F,X0,15,0);
+    R2(AL,BL,CL,DL,EL,J,X6,8,0xA953FD4E, AR,BR,CR,DR,ER,F,X3,13,0);
+    R2(AL,BL,CL,DL,EL,J,X15,5,0xA953FD4E, AR,BR,CR,DR,ER,F,X9,11,0);
+    R2(AL,BL,CL,DL,EL,J,X13,6,0xA953FD4E, AR,BR,CR,DR,ER,F,X11,11,0);
     
-    for (int j = 32; j < 48; j++) {
-        ROUND(AL, BL, CL, DL, EL, H, X[c_ZL[j]], c_SL[j], c_K1[2]);
-    }
-    
-    
-    
-    for (int j = 48; j < 64; j++) {
-        ROUND(AL, BL, CL, DL, EL, I, X[c_ZL[j]], c_SL[j], c_K1[3]);
-    }
-    
-    
-    
-    for (int j = 64; j < 80; j++) {
-        ROUND(AL, BL, CL, DL, EL, J, X[c_ZL[j]], c_SL[j], c_K1[4]);
-    }
-    
-    
-    
-    for (int j = 0; j < 16; j++) {
-        ROUND(AR, BR, CR, DR, ER, J, X[c_ZR[j]], c_SR[j], c_K2[0]);
-    }
-    
-    
-    
-    for (int j = 16; j < 32; j++) {
-        ROUND(AR, BR, CR, DR, ER, I, X[c_ZR[j]], c_SR[j], c_K2[1]);
-    }
-    
-    
-    
-    for (int j = 32; j < 48; j++) {
-        ROUND(AR, BR, CR, DR, ER, H, X[c_ZR[j]], c_SR[j], c_K2[2]);
-    }
-    
-    
-    
-    for (int j = 48; j < 64; j++) {
-        ROUND(AR, BR, CR, DR, ER, G, X[c_ZR[j]], c_SR[j], c_K2[3]);
-    }
-    
-    
-    
-    for (int j = 64; j < 80; j++) {
-        ROUND(AR, BR, CR, DR, ER, F, X[c_ZR[j]], c_SR[j], c_K2[4]);
-    }
-    
-    
-    // Combine results
     uint32_t T = 0xEFCDAB89 + CL + DR;
     
-    // Vector store output
     uint32_t* out32 = reinterpret_cast<uint32_t*>(out);
     out32[0] = T;
     out32[1] = 0x98BADCFE + DL + ER;
@@ -1092,7 +1394,7 @@ __device__ void jacobian_to_hash160_direct(const ECPointJac *P, uint8_t hash160_
     
     
     
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 20; i++) {
         hash160_out[i] = full_hash[i];
     }
 }
@@ -1114,126 +1416,183 @@ __device__ void jacobian_to_affine(ECPoint *R, const ECPointJac *P) {
 }
 
 __device__ __forceinline__ void scalar_multiply_multi_base_jac(ECPointJac *result, const BigInt *scalar) {
-    // Find first non-zero window to avoid infinity checks in main loop
+    
     int first_window = -1;
     
-    #pragma unroll
+    
     for (int window = NUM_BASE_POINTS - 1; window >= 0; window--) {
         int bit_index = window * WINDOW_SIZE;
-        uint32_t word_idx = bit_index >> 5;  // Divide by 32
-        uint32_t bit_offset = bit_index & 31; // Modulo 32
+        uint32_t word_idx = bit_index >> 5;  
+        uint32_t bit_offset = bit_index & 31;
         
-        // Extract window value
-        uint32_t window_val = scalar->data[word_idx] >> bit_offset;
-        if (bit_offset + WINDOW_SIZE > 32) {
-            window_val |= scalar->data[word_idx + 1] << (32 - bit_offset);
+        uint32_t window_val;
+        
+        
+        if (bit_offset + WINDOW_SIZE <= 32) {
+            asm("bfe.u32 %0, %1, %2, %3;" 
+                : "=r"(window_val) 
+                : "r"(scalar->data[word_idx]), "r"(bit_offset), "r"(WINDOW_SIZE));
+        } else {
+            uint32_t lo = scalar->data[word_idx];
+            uint32_t hi = scalar->data[word_idx + 1];
+            uint32_t combined;
+            
+            asm("shf.r.wrap.b32 %0, %1, %2, %3;" 
+                : "=r"(combined) 
+                : "r"(lo), "r"(hi), "r"(bit_offset));
+            
+            asm("bfe.u32 %0, %1, 0, %2;" 
+                : "=r"(window_val) 
+                : "r"(combined), "r"(WINDOW_SIZE));
         }
-        window_val &= (1U << WINDOW_SIZE) - 1;
         
         if (window_val != 0) {
-            // Initialize with first non-zero window
             *result = G_base_precomp[window][window_val];
             first_window = window;
             break;
         }
     }
     
-    // Handle case where scalar is zero
     if (first_window == -1) {
         point_set_infinity_jac(result);
         return;
     }
     
-    // Process remaining windows
-    #pragma unroll
+    
     for (int window = first_window - 1; window >= 0; window--) {
         int bit_index = window * WINDOW_SIZE;
         uint32_t word_idx = bit_index >> 5;
         uint32_t bit_offset = bit_index & 31;
         
-        uint32_t window_val = scalar->data[word_idx] >> bit_offset;
-        if (bit_offset + WINDOW_SIZE > 32) {
-            window_val |= scalar->data[word_idx + 1] << (32 - bit_offset);
-        }
-        window_val &= (1U << WINDOW_SIZE) - 1;
+        uint32_t window_val;
         
-		ECPointJac temp = G_base_precomp[window][window_val];
-		if (window_val != 0) {
-			add_point_jac(result, result, &temp);
-		}
+        if (bit_offset + WINDOW_SIZE <= 32) {
+            asm("bfe.u32 %0, %1, %2, %3;" 
+                : "=r"(window_val) 
+                : "r"(scalar->data[word_idx]), "r"(bit_offset), "r"(WINDOW_SIZE));
+        } else {
+            uint32_t lo = scalar->data[word_idx];
+            uint32_t hi = scalar->data[word_idx + 1];
+            uint32_t combined;
+            
+            asm("shf.r.wrap.b32 %0, %1, %2, %3;" 
+                : "=r"(combined) 
+                : "r"(lo), "r"(hi), "r"(bit_offset));
+            
+            asm("bfe.u32 %0, %1, 0, %2;" 
+                : "=r"(window_val) 
+                : "r"(combined), "r"(WINDOW_SIZE));
+        }
+        
+        ECPointJac temp = G_base_precomp[window][window_val];
+        if (window_val != 0) {
+            add_point_jac(result, result, &temp);
+        }
     }
 }
-
 __device__ void jacobian_batch_to_hash160(const ECPointJac points[BATCH_SIZE], uint8_t hash160_out[BATCH_SIZE][20]) {
     
-    uint8_t valid_map[BATCH_SIZE];
+    bool is_valid[BATCH_SIZE];
+    uint8_t valid_indices[BATCH_SIZE];
     uint8_t valid_count = 0;
     
-    // Clear invalid points and build valid map
-    #pragma unroll
+    
     for (int i = 0; i < BATCH_SIZE; i++) {
-        uint32_t z_check = points[i].Z.data[0] | points[i].Z.data[1] | 
-                          points[i].Z.data[2] | points[i].Z.data[3] |
-                          points[i].Z.data[4] | points[i].Z.data[5] | 
-                          points[i].Z.data[6] | points[i].Z.data[7];
         
-        bool is_valid = (!points[i].infinity) & (z_check != 0);
+        uint32_t z_check;
         
-        if (is_valid) {
-            valid_map[valid_count++] = i;
-        } else {
-            *((uint64_t*)hash160_out[i]) = 0;
-            *((uint64_t*)(hash160_out[i] + 8)) = 0;
+        
+        uint4 z_vec0 = *((uint4*)&points[i].Z.data[0]);
+        uint4 z_vec1 = *((uint4*)&points[i].Z.data[4]);
+        
+        
+        asm("{\n\t"
+            ".reg .u32 t0, t1, t2, t3;\n\t"
+            "or.b32 t0, %1, %2;\n\t"
+            "or.b32 t1, %3, %4;\n\t"
+            "or.b32 t2, %5, %6;\n\t"
+            "or.b32 t3, %7, %8;\n\t"
+            "or.b32 t0, t0, t1;\n\t"
+            "or.b32 t2, t2, t3;\n\t"
+            "or.b32 %0, t0, t2;\n\t"
+            "}"
+            : "=r"(z_check)
+            : "r"(z_vec0.x), "r"(z_vec0.y), "r"(z_vec0.z), "r"(z_vec0.w),
+              "r"(z_vec1.x), "r"(z_vec1.y), "r"(z_vec1.z), "r"(z_vec1.w));
+        
+        is_valid[i] = (!points[i].infinity) && (z_check != 0);
+        
+        if (!is_valid[i]) {
+            
+            uint4* zero_ptr = (uint4*)hash160_out[i];
+            zero_ptr[0] = make_uint4(0, 0, 0, 0);
+            zero_ptr[1] = make_uint4(0, 0, 0, 0);
             *((uint32_t*)(hash160_out[i] + 16)) = 0;
+        } else {
+            valid_indices[valid_count++] = i;
         }
     }
     
     if (valid_count == 0) return;
     
-    // Montgomery batch inversion
+    
     BigInt products[BATCH_SIZE];
     BigInt inverses[BATCH_SIZE];
     
-    copy_bigint(&products[0], &points[valid_map[0]].Z);
+    copy_bigint(&products[0], &points[valid_indices[0]].Z);
+    
     
     for (int i = 1; i < valid_count; i++) {
-        mul_mod_device(&products[i], &products[i-1], &points[valid_map[i]].Z);
+        mul_mod_device(&products[i], &products[i-1], &points[valid_indices[i]].Z);
     }
+    
     
     BigInt current_inv;
     mod_inverse(&current_inv, &products[valid_count - 1]);
     
+    
     for (int i = valid_count - 1; i > 0; i--) {
         mul_mod_device(&inverses[i], &current_inv, &products[i-1]);
-        mul_mod_device(&current_inv, &current_inv, &points[valid_map[i]].Z);
+        mul_mod_device(&current_inv, &current_inv, &points[valid_indices[i]].Z);
     }
     copy_bigint(&inverses[0], &current_inv);
     
-    // Convert to affine and compute hash160
-    for (int i = 0; i < valid_count; i++) {
-        uint8_t idx = valid_map[i];
+    
+    for (int v = 0; v < valid_count; v++) {
+        uint8_t idx = valid_indices[v];
+        
         
         BigInt Zinv2, Zinv3;
-        mul_mod_device(&Zinv2, &inverses[i], &inverses[i]);
-        mul_mod_device(&Zinv3, &Zinv2, &inverses[i]);
+        mul_mod_device(&Zinv2, &inverses[v], &inverses[v]);
+        mul_mod_device(&Zinv3, &Zinv2, &inverses[v]);
+        
         
         BigInt x_affine, y_affine;
         mul_mod_device(&x_affine, &points[idx].X, &Zinv2);
         mul_mod_device(&y_affine, &points[idx].Y, &Zinv3);
         
-        // Build compressed pubkey directly
-        uint8_t pubkey[33];
-        pubkey[0] = 0x02 | (y_affine.data[0] & 1);
         
-        #pragma unroll
+        uint8_t pubkey[33];
+        
+        
+        uint32_t parity;
+        asm("bfe.u32 %0, %1, 0, 1;" : "=r"(parity) : "r"(y_affine.data[0]));
+        pubkey[0] = 0x02 | parity;
+        
+        
+        uint32_t* x_data = x_affine.data;
+        
         for (int j = 0; j < 8; j++) {
-            uint32_t word = x_affine.data[7 - j];
-            int base = 1 + (j << 2);
-            pubkey[base]     = word >> 24;
-            pubkey[base + 1] = word >> 16;
-            pubkey[base + 2] = word >> 8;
-            pubkey[base + 3] = word;
+            uint32_t word = x_data[7 - j];
+            uint32_t swapped;
+            
+            
+            asm("prmt.b32 %0, %1, 0, 0x0123;" : "=r"(swapped) : "r"(word));
+            
+            
+            *((uint32_t*)&pubkey[1 + j * 4]) = swapped;
         }
+        
         
         hash160(pubkey, 33, hash160_out[idx]);
     }
@@ -1420,12 +1779,12 @@ void init_gpu_constants() {
     printf("Precomputation complete and verified.\n");
 }
 
-// OPTIMIZED: Specialized version for adding G (where G.Z = 1) to any point P
+
 __device__ __forceinline__ void add_G_to_point_jac(ECPointJac *R, const ECPointJac *P) {
-    // Since G.Z = 1, many operations simplify:
-    // Z2Z2 = 1, Z2^3 = 1
-    // U2 = G.X * Z1^2
-    // S2 = G.Y * Z1^3
+    
+    
+    
+    
     
     if (__builtin_expect(P->infinity, 0)) { 
         point_copy_jac(R, &const_G_jacobian); 
@@ -1435,22 +1794,22 @@ __device__ __forceinline__ void add_G_to_point_jac(ECPointJac *R, const ECPointJ
     BigInt Z1Z1, Z1Z1Z1, U1, U2, H, S1, S2, R_big;
     BigInt H2, H3, U1H2, R2, temp;
     
-    // Step 1: Z1^2 (only need to compute P's Z squared)
+    
     mul_mod_device(&Z1Z1, &P->Z, &P->Z);
     
-    // Step 2: U1 = P.X, U2 = G.X * Z1^2
+    
     copy_bigint(&U1, &P->X);
     mul_mod_device(&U2, &const_G_jacobian.X, &Z1Z1);
     
-    // Step 3: H = U2 - U1
+    
     sub_mod_device_fast(&H, &U2, &U1);
     
-    // Fast check for point doubling (extremely rare with random points)
+    
     if (__builtin_expect(is_zero(&H), 0)) {
-        // Z1^3 for S comparison
+        
         mul_mod_device(&Z1Z1Z1, &Z1Z1, &P->Z);
         
-        // S1 = P.Y, S2 = G.Y * Z1^3
+        
         copy_bigint(&S1, &P->Y);
         mul_mod_device(&S2, &const_G_jacobian.Y, &Z1Z1Z1);
         
@@ -1462,39 +1821,39 @@ __device__ __forceinline__ void add_G_to_point_jac(ECPointJac *R, const ECPointJ
         return;
     }
     
-    // Main addition case
-    // Z1^3 = Z1^2 * Z1
+    
+    
     mul_mod_device(&Z1Z1Z1, &Z1Z1, &P->Z);
     
-    // S1 = P.Y, S2 = G.Y * Z1^3
+    
     copy_bigint(&S1, &P->Y);
     mul_mod_device(&S2, &const_G_jacobian.Y, &Z1Z1Z1);
     
-    // R = S2 - S1
+    
     sub_mod_device_fast(&R_big, &S2, &S1);
     
-    // H^2 and H^3
+    
     mul_mod_device(&H2, &H, &H);
     mul_mod_device(&H3, &H2, &H);
     
-    // U1*H^2
+    
     mul_mod_device(&U1H2, &U1, &H2);
     
-    // R^2
+    
     mul_mod_device(&R2, &R_big, &R_big);
     
-    // X3 = R^2 - H^3 - 2*U1*H^2
+    
     sub_mod_device_fast(&R->X, &R2, &H3);
     sub_mod_device_fast(&R->X, &R->X, &U1H2);
     sub_mod_device_fast(&R->X, &R->X, &U1H2);
     
-    // Y3 = R*(U1*H^2 - X3) - S1*H^3
+    
     sub_mod_device_fast(&temp, &U1H2, &R->X);
     mul_mod_device(&temp, &R_big, &temp);
     mul_mod_device(&S1, &S1, &H3);
     sub_mod_device_fast(&R->Y, &temp, &S1);
     
-    // Z3 = Z1*H (since G.Z = 1)
+    
     mul_mod_device(&R->Z, &P->Z, &H);
     
     R->infinity = false;
